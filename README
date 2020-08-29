@@ -1,0 +1,11 @@
+MPPT charge controller for maximum power
+
+- free software and hardware design.  Can be adapted to other requirements.
+- all ceramic capacitors.
+- buck/boost design allow either higher or lower voltage of battery vs panel.
+- components rated for up to 48 volt system (60 volt mosfets)
+- voltage and current monitoring on both input and output.
+- high-efficiency regulators to power the 3.3v logic as well as the 10v needed for gate drive.
+
+
+This project uses the stm32duino environment.
