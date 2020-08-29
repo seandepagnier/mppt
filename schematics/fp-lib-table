@@ -1,0 +1,3 @@
+(fp_lib_table
+  (lib (name mppt_footprints)(type KiCad)(uri ${KIPRJMOD}/mppt_footprints.pretty)(options "")(descr ""))
+)
