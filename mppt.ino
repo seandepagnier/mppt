@@ -28,11 +28,12 @@ uint32_t keyt[3];
 uint32_t off_time, on_time;
 static float lastvin, lastpout;
 float vin, vout, iin, iout, pin, pout, temp=25, debug;
-int page=1, pages = 4;
+int page=1, pages = 5;
 
 struct {
     float off_voltage;
     float on_voltage;
+    int backlight;
     uint32_t sig;
 } eemem;
 
@@ -56,11 +57,8 @@ void read_keys() {
        case 0:
           if(++page == pages)
               page = 0;
-          //if(page == 1)
-            //  page = 2;
           if(need_write)
               EEPROM.put(0, eemem);
-
           break;
        case 1:
           mod = 1;
@@ -76,12 +74,16 @@ void read_keys() {
         else {
           float off_voltage = eemem.off_voltage, on_voltage = eemem.on_voltage;
           if(page == 2)
-             off_voltage += .1*mod; 
+               off_voltage += .1*mod; 
           else if(page == 3)
-             on_voltage += .1*mod; 
+               on_voltage += .1*mod;
+          else if(page == 4) {
+              eemem.backlight = eemem.backlight == LOW ? HIGH : LOW;
+              digitalWrite(BACKLIGHT, eemem.backlight);
+          }
           if(on_voltage < off_voltage - .1) {
-            eemem.off_voltage = off_voltage;
-            eemem.on_voltage = on_voltage;
+              eemem.off_voltage = off_voltage;
+              eemem.on_voltage = on_voltage;
           }
           need_write = true;
         }
@@ -113,7 +115,7 @@ void display_default()
 {
     display.setTextColor(BLACK);
     display.setTextSize(1);
-    display.setCursor(0,0);
+    display.setCursor(0, 0);
     display.println("voltage");
     display_number(vout);
     display.setTextSize(1);
@@ -138,7 +140,7 @@ void display_info()
     // rotation example
     display.setTextSize(1);
     display.setTextColor(BLACK);
-    display.setCursor(0,0);
+    display.setCursor(0, 0);
     display.print("Vi ");
 
     display.println(int(vin*100)/100.0);
@@ -175,7 +177,7 @@ void display_set_off_voltage()
 {
     display.setTextSize(1);
     display.setTextColor(BLACK);
-    display.setCursor(0,0);
+    display.setCursor(0, 0);
     display.println("PV Off");
     display.print(eemem.off_voltage);
     display.println("v");
@@ -185,16 +187,23 @@ void display_set_on_voltage()
 {
     display.setTextSize(1);
     display.setTextColor(BLACK);
-    display.setCursor(0,0);
+    display.setCursor(0, 0);
     display.println("PV On");
     display.print(eemem.on_voltage);
     display.println("v");
 }
 
-void setup()   {
-    // backlight
-    pinMode(BACKLIGHT, OUTPUT);
-  
+void display_set_backlight()
+{
+    display.setTextSize(1);
+    display.setTextColor(BLACK);
+    display.setCursor(0, 0);
+    display.println("back\nlight");
+    display.println(eemem.backlight == LOW ? "on" : "off");
+    display.println("uses\n36mW");
+}
+
+void setup()   {  
     // enable led output
     pinMode(LED, OUTPUT);
     digitalWrite(LED, HIGH); // off
@@ -202,10 +211,6 @@ void setup()   {
     // enable sense and reference
     digitalWrite(SENSE, HIGH);
     pinMode(SENSE, OUTPUT);
-
-    // enable 12v power
-    pinMode(DRIVER_POWER, OUTPUT);
-    digitalWrite(DRIVER_POWER, HIGH);
 
     // set input keys internal pullup resistor
     for(int i=0; i<keys_n; i++)
@@ -220,12 +225,18 @@ void setup()   {
 
     // read eeprom settings for panel on and off voltage
     EEPROM.get(0, eemem);
-    uint32_t sig = 0xF2BB328E;
+    uint32_t sig = 0xF2BB328F;
     if(eemem.sig != sig) {//
         eemem.off_voltage = 13.6; // turn off above this voltage
         eemem.on_voltage = 13.2;
+        eemem.backlight = LOW;
         eemem.sig = sig;
     }
+
+    // backlight
+    pinMode(BACKLIGHT, OUTPUT);
+    digitalWrite(BACKLIGHT, eemem.backlight);
+
 
     setup_pwm();
 }
@@ -287,6 +298,11 @@ void setup_pwm()
 
 void pwm_on()
 {
+    // enable 12v power
+    pinMode(DRIVER_POWER, OUTPUT);
+    digitalWrite(DRIVER_POWER, HIGH);
+    delay(10);
+  
     // ensure bootstrap capacitor is charged by manually setting low side mosfet on
     digitalWrite(PB13, LOW);
     digitalWrite(PA8, LOW);
@@ -343,6 +359,11 @@ void pwm_off()
     pinMode(PA8, OUTPUT);
     HAL_TIM_PWM_Stop(&pwm_handle, TIM_CHANNEL_1);
     HAL_TIMEx_PWMN_Stop(&pwm_handle, TIM_CHANNEL_1);
+
+    delay(10);
+    // disable 12v power
+    pinMode(DRIVER_POWER, OUTPUT);
+    digitalWrite(DRIVER_POWER, LOW);
 }
 
 void update_duty() {
@@ -459,7 +480,7 @@ void loop()
     case 1: display_info(); break;
     case 2: display_set_off_voltage(); break;
     case 3: display_set_on_voltage(); break;
-    
+    case 4: display_set_backlight(); break;    
     }
 
     if(temp > max_temp) {
