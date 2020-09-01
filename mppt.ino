@@ -28,14 +28,22 @@ uint32_t keyt[3];
 uint32_t off_time, on_time;
 static float lastvin, lastpout;
 float vin, vout, iin, iout, pin, pout, temp=25, debug;
-int page=1, pages = 5;
+int page=1, pages = 6;
 
 struct {
     float off_voltage;
     float on_voltage;
     int backlight;
+    int frequency;
     uint32_t sig;
 } eemem;
+
+
+TIM_HandleTypeDef pwm_handle;
+const int deadtime = 14; // cycles, .625uS
+static uint32_t pwm_max, pwm_min_comp;
+static float min_duty, max_duty;
+
 
 bool need_write = false;
 void read_keys() {
@@ -80,7 +88,10 @@ void read_keys() {
           else if(page == 4) {
               eemem.backlight = eemem.backlight == LOW ? HIGH : LOW;
               digitalWrite(BACKLIGHT, eemem.backlight);
+          } else if(page == 5) {
+               eemem.frequency += mod;
           }
+          
           if(on_voltage < off_voltage - .1) {
               eemem.off_voltage = off_voltage;
               eemem.on_voltage = on_voltage;
@@ -101,9 +112,9 @@ void display_number(float v)
         x = 34;
     }
     for(int i=0; i<4; i++) {
-      display.setCursor((3-i)*12,y);
-      display.print(n%10);
-      n/=10;
+        display.setCursor((3-i)*12,y);
+        display.print(n%10);
+        n/=10;
     }
 
     // draw decimal without wasting horizontal space    
@@ -160,7 +171,7 @@ void display_info()
         display.print(int(pout / pin * 100.0) );
         display.println("%");
         display.print("du ");
-        display.println(int(1000*duty)/10.0);    
+        display.println(int(10000*duty)/100.0);    
     } else
         display.println("OFF");
 
@@ -203,6 +214,32 @@ void display_set_backlight()
     display.println("uses\n36mW");
 }
 
+int get_frequency()
+{
+    switch(eemem.frequency) {
+        case 1:
+           return 20000;
+        case 2:
+           return 40000;
+        case 3:
+           return 80000;
+        default:
+           eemem.frequency = 0;
+           return 10000;
+    }
+}
+
+void display_set_frequency()
+{
+    display.setTextSize(1);
+    display.setTextColor(BLACK);
+    display.setCursor(0, 0);
+    display.println("frequency");
+
+    display.println(get_frequency());
+}
+
+
 void setup()   {  
     // enable led output
     pinMode(LED, OUTPUT);
@@ -230,6 +267,7 @@ void setup()   {
         eemem.off_voltage = 13.6; // turn off above this voltage
         eemem.on_voltage = 13.2;
         eemem.backlight = LOW;
+        eemem.frequency = 0;
         eemem.sig = sig;
     }
 
@@ -237,12 +275,9 @@ void setup()   {
     pinMode(BACKLIGHT, OUTPUT);
     digitalWrite(BACKLIGHT, eemem.backlight);
 
-
     setup_pwm();
 }
 
-
-TIM_HandleTypeDef pwm_handle;
 
 void setup_pwm()
 {
@@ -285,7 +320,7 @@ void setup_pwm()
     /* Set the Break feature & Dead time */
     TIM_BreakDeadTimeConfigTypeDef sBreakConfig;
     sBreakConfig.BreakState       = TIM_BREAK_DISABLE;
-    sBreakConfig.DeadTime         = 14;
+    sBreakConfig.DeadTime         = deadtime;
     sBreakConfig.OffStateRunMode  = TIM_OSSR_ENABLE;
     sBreakConfig.OffStateIDLEMode = TIM_OSSI_ENABLE;
     sBreakConfig.LockLevel        = 0;//TIM_LOCKLEVEL_1;  
@@ -311,54 +346,82 @@ void pwm_on()
     digitalWrite(PB13, HIGH);
     digitalWrite(PB13, LOW);
 
-    // ramp up duty cycle gradually with only high-side mosfet
-    // at 4khz over 70 milliseconds.   This avoids charging
-    // the low-side capacitor too quickly which would cause
-    // the processor to reset from inrush
-    pinmap_pinout(digitalPinToPinName(PA8), PinMap_PWM);  
-    __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, 50);
-    __HAL_TIM_SET_AUTORELOAD(&pwm_handle, 2000);
-    HAL_TIM_PWM_Start(&pwm_handle, TIM_CHANNEL_1);
-
-    for(int i=3; i<70; i++) {
-        __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1,25*i);
-        delay(1);
-    }
-
-    // begin pwm at 20khz
+    delay(1);
+#if 0
+    digitalWrite(PA8, HIGH);
+    delay(100);
+    digitalWrite(PA8, LOW);
+#endif
+    delay(1);
+    
+#if 0
+    __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, 320);
     __HAL_TIM_SET_AUTORELOAD(&pwm_handle, 400);
 
-    duty = 1; // set maximum duty cycle
-    pwm_set();
 
-    delay(10);
-    // enable pwm (with dead time) to drive low-side mosfet now
+    pinmap_pinout(digitalPinToPinName(PA8), PinMap_PWM); 
+    HAL_TIM_PWM_Start(&pwm_handle, TIM_CHANNEL_1);
+
     pinmap_pinout(digitalPinToPinName(PB13), PinMap_PWM);
     HAL_TIMEx_PWMN_Start(&pwm_handle, TIM_CHANNEL_1);
 
+    for(int i=0;i<20;i++) {
+          __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, 320+i);
+        delay(100);
+    }
+    for(;;);
+#endif
+    
+    // begin pwm
+    pwm_max = 8000000 / get_frequency();
+
+    min_duty = .5;
+    pwm_min_comp = deadtime*5/2;
+    max_duty = 1 - (float)pwm_min_comp/pwm_max;
+
+    __HAL_TIM_SET_AUTORELOAD(&pwm_handle, pwm_max);
+        __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, 35);
+
+    pinmap_pinout(digitalPinToPinName(PA8), PinMap_PWM); 
+    HAL_TIM_PWM_Start(&pwm_handle, TIM_CHANNEL_1);
+#if 1
+    for(int i=10; i<90; i++) {
+        __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, i*4);
+        delay(1);
+    }     
+#endif
+  duty = 1;
+  pwm_set();
+    // enable pwm (with dead time) to drive low-side mosfet now
+    pinmap_pinout(digitalPinToPinName(PB13), PinMap_PWM);
+    HAL_TIMEx_PWMN_Start(&pwm_handle, TIM_CHANNEL_1);
 }
 
 void pwm_set()
 {
-    int compare = 400*(1-duty);
+    int compare = pwm_max*(1.0-duty);
 
-    if(compare < 35)
-        compare = 35;   // minimum allowed
+    if(compare < pwm_min_comp)
+        compare = pwm_min_comp;   // minimum allowed
 
-    if(compare > 200)
-        compare = 200;  // maximum allowed
+    if(compare > pwm_max/2)
+        compare = pwm_max;  // maximum allowed
 
-    __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, 400-compare);
+    __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, pwm_max-compare);
+    //__HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, pwm_max-65);
 }
 
 void pwm_off()
 {
+
     digitalWrite(PB13, LOW);
     digitalWrite(PA8, LOW);
     pinMode(PB13, OUTPUT);
     pinMode(PA8, OUTPUT);
     HAL_TIM_PWM_Stop(&pwm_handle, TIM_CHANNEL_1);
     HAL_TIMEx_PWMN_Stop(&pwm_handle, TIM_CHANNEL_1);
+
+    return;
 
     delay(10);
     // disable 12v power
@@ -372,14 +435,14 @@ void update_duty() {
     float vindt = vin - lastvin;
 
     // D should be less than P
-    float P = .02, D = 0.005;
+    float P = .01, D = 0;
     duty += P*err + D*vindt;
-    if(duty > .92)
-        duty = .92;
+    if(duty > max_duty)
+        duty = max_duty;
 
     // for now, avoid large voltage differences
-    if(duty < .5)
-        duty = .5;
+    if(duty < min_duty)
+        duty = min_duty;
 
     pwm_set();
 }
@@ -436,23 +499,29 @@ void loop()
         uint32_t t = HAL_GetTick();
         if(t-on_time > 500) { // don't stop or adjust duty unless running at least 500 ticks
             // overtemp, current has gone negative, or output voltage too high: turn off
-            if(temp > max_temp || iout < -.05 || vout > eemem.off_voltage) {
+            if(temp > max_temp || iout < -.05 || vout > eemem.off_voltage || pwm_max != 8000000 / get_frequency()) {
                 pwm_off();
                 off_time = t;
                 running = false;
                 digitalWrite(LED, HIGH); // off
             } else {
                 update_duty();
-                static float trackingdir = .2, avgpout;
+                static float trackingdir = .15, avgpout;
                 static int trackingcount = 0;
-                if(trackingcount >= 5)
+                if(fabs(vin-mppt_voltage) < .05 || duty == max_duty || duty == min_duty) {
+                    trackingcount++;
                     avgpout += pout;
-                if(++trackingcount == 15) {
-                    avgpout /= 10;
-                    debug = avgpout;
+                }
+                if(trackingcount == 5) {
+                    avgpout /= trackingcount;
+                    debug = max_duty;
                     trackingcount = 0;
                     if(lastpout > avgpout) // change dir
                         trackingdir = -trackingdir;
+                    if(duty == max_duty)
+                        trackingdir = fabs(trackingdir);
+                    else if(duty == min_duty)
+                        trackingdir = -fabs(trackingdir);
                     lastpout = avgpout;
                     mppt_voltage += trackingdir;
                     avgpout = 0;
@@ -480,7 +549,8 @@ void loop()
     case 1: display_info(); break;
     case 2: display_set_off_voltage(); break;
     case 3: display_set_on_voltage(); break;
-    case 4: display_set_backlight(); break;    
+    case 4: display_set_backlight(); break;
+    case 5: display_set_frequency(); break;
     }
 
     if(temp > max_temp) {
