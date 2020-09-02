@@ -347,30 +347,7 @@ void pwm_on()
     digitalWrite(PB13, LOW);
 
     delay(1);
-#if 0
-    digitalWrite(PA8, HIGH);
-    delay(100);
-    digitalWrite(PA8, LOW);
-#endif
     delay(1);
-    
-#if 0
-    __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, 320);
-    __HAL_TIM_SET_AUTORELOAD(&pwm_handle, 400);
-
-
-    pinmap_pinout(digitalPinToPinName(PA8), PinMap_PWM); 
-    HAL_TIM_PWM_Start(&pwm_handle, TIM_CHANNEL_1);
-
-    pinmap_pinout(digitalPinToPinName(PB13), PinMap_PWM);
-    HAL_TIMEx_PWMN_Start(&pwm_handle, TIM_CHANNEL_1);
-
-    for(int i=0;i<20;i++) {
-          __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, 320+i);
-        delay(100);
-    }
-    for(;;);
-#endif
     
     // begin pwm
     pwm_max = 8000000 / get_frequency();
@@ -380,16 +357,15 @@ void pwm_on()
     max_duty = 1 - (float)pwm_min_comp/pwm_max;
 
     __HAL_TIM_SET_AUTORELOAD(&pwm_handle, pwm_max);
-        __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, 35);
+    __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, 35);
 
     pinmap_pinout(digitalPinToPinName(PA8), PinMap_PWM); 
     HAL_TIM_PWM_Start(&pwm_handle, TIM_CHANNEL_1);
-#if 1
     for(int i=10; i<90; i++) {
         __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, i*4);
         delay(1);
     }     
-#endif
+
   duty = 1;
   pwm_set();
     // enable pwm (with dead time) to drive low-side mosfet now

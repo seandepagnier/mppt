@@ -226,7 +226,7 @@ F 3 "" H 10000 3100 50  0001 C CNN
 	1    0    0    -1  
 $EndComp
 $Comp
-L pypilot_components:ncp5106b U5
+L mppt-rescue:ncp5106b-pypilot_components U5
 U 1 1 5EAFCEC6
 P 6950 3850
 F 0 "U5" H 6700 3800 60  0000 C CNN
@@ -2297,7 +2297,7 @@ AMP
 Text GLabel 9500 3750 2    50   Input ~ 0
 CSREF
 $Comp
-L pypilot_components:INA199 U6
+L mppt-rescue:INA199-pypilot_components U6
 U 1 1 5ED38D71
 P 9200 3400
 F 0 "U6" H 9300 3400 60  0000 C CNN
@@ -3362,7 +3362,7 @@ F 4 "C17414" H 9650 3050 50  0001 C CNN "LCSC"
 	0    -1   1    0   
 $EndComp
 $Comp
-L pypilot_components:INA199 U4
+L mppt-rescue:INA199-pypilot_components U4
 U 1 1 5EB81CEA
 P 6350 2800
 F 0 "U4" H 6450 2800 60  0000 C CNN
