@@ -1,541 +1,529 @@
-/* Copyright (C) 2020 Sean D'Epagnier <seandepagnier@gmail.com>                                                                                                                              *                                                                                                                                                                                           * This Program is free software; you can redistribute it and/or                                                                                                                             * modify it under the terms of the GNU General Public                                                                                                                                       * License as published by the Free Software Foundation; either                                                                                                                              * version 3 of the License, or (at your option) any later version.                                                                                                                         */
-                                                                         
-///   mppt code
-
-#include <SPI.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_PCD8544.h>
-
-// Hardware SPI nokia5110 display
-Adafruit_PCD8544 display = Adafruit_PCD8544(PB10, PA4, PB11);
-
-#include <EEPROM.h>
-
-#define BACKLIGHT PB12
-#define LED PC13
-#define SENSE PC14
-#define DRIVER_POWER PC15  // enable power to drive mosfet gates
-
-bool running = false;
-
-float mppt_voltage = 17;
-float max_temp = 55;
-float duty;
-
-int keys[] = {PB3, PB4, PB5};
-int keys_n = (sizeof keys)/(sizeof *keys);
-uint32_t keyt[3];
-uint32_t off_time, on_time;
-static float lastvin, lastpout;
-float vin, vout, iin, iout, pin, pout, temp=25, debug;
-int page=1, pages = 6;
-
-struct {
-    float off_voltage;
-    float on_voltage;
-    int backlight;
-    int frequency;
-    uint32_t sig;
-} eemem;
+/* Copyright (C) 2023 Sean D'Epagnier <seandepagnier@gmail.com>
+ *
+ * This Program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public
+ * License as published by the Free Software Foundation; either
+ * version 3 of the License, or (at your option) any later version.
+ */
 
 
-TIM_HandleTypeDef pwm_handle;
-const int deadtime = 14; // cycles, .625uS
-static uint32_t pwm_max, pwm_min_comp;
-static float min_duty, max_duty;
+/* TODO:
+
+real time clock for all logging
+app the display and visualize data
+update schematic with sync amp on high side for boosting, and isolated power for 100% duty
+
+add hydro mppt algorithms
+*/
+
+//#define USE_BT
+//#define USE_SD
+
+#ifdef USE_BT
+
+#include "BluetoothSerial.h"
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run `make menuconfig` to and enable it
+#endif
+
+BluetoothSerial SerialBT;
+#endif
+
+#ifdef USE_SD
+#include "FS.h"
+#include "SD.h"
+#endif
+
+float vmppt, duty;
 
 
-bool need_write = false;
-void read_keys() {
-    int trig = -1;
-    uint32_t t = HAL_GetTick();
-    for(int i=0; i<keys_n; i++)
-        if(digitalRead(keys[i])) {
-          if(keyt[i] && t-keyt[i] > 50) {
-               trig = i;
-               keyt[i] = 0;
-          }
-        } else {
-          if(!keyt[i])
-              keyt[i] = t;
-        }
+#include <math.h>
 
-    int mod = 0;
-    switch(trig) {
-       case 0:
-          if(++page == pages)
-              page = 0;
-          if(need_write)
-              EEPROM.put(0, eemem);
-          break;
-       case 1:
-          mod = 1;
-          break;
-       case 2:
-          mod = -1;
-          break;
+const int tempInPin = 32;
+const int iddInPin = 25;
+const int iccInPin = 26;
+const int vddInPin = 34;
+const int vccInPin = 35;
+
+const int pwrdwnPin = 2; // turn off 12v
+
+const int buck_lPin = 14;
+const int buck_hPin = 15;
+const int boost_lPin = 12;
+const int boost_hPin = 13;
+
+const int ledPin = 27;
+
+int minVoltage = 7;
+int maxVoltage = 32;
+int maxInputCurrent = 7;
+float startVoltage = 13.4f;
+float endVoltage = 13.8f;
+
+#include "driver/mcpwm.h"
+#include "soc/mcpwm_reg.h"
+#include "soc/mcpwm_struct.h"
+
+
+
+void setupSD() {
+#ifdef USE_SD
+    if(!SD.begin()){
+        Serial.println("Card Mount Failed");
+        return;
+    }
+  
+    uint8_t cardType = SD.cardType();
+
+    if(cardType == CARD_NONE){
+        Serial.println("No SD card attached");
+        return;
     }
 
-    if(mod)
-        if(page < 2)     
-            page = !page;
-        else {
-          float off_voltage = eemem.off_voltage, on_voltage = eemem.on_voltage;
-          if(page == 2)
-               off_voltage += .1*mod; 
-          else if(page == 3)
-               on_voltage += .1*mod;
-          else if(page == 4) {
-              eemem.backlight = eemem.backlight == LOW ? HIGH : LOW;
-              digitalWrite(BACKLIGHT, eemem.backlight);
-          } else if(page == 5) {
-               eemem.frequency += mod;
-          }
-          
-          if(on_voltage < off_voltage - .1) {
-              eemem.off_voltage = off_voltage;
-              eemem.on_voltage = on_voltage;
-          }
-          need_write = true;
-        }
-}
+    Serial.print("SD Card Type: ");
+    if(cardType == CARD_MMC){
+        Serial.println("MMC");
+    } else if(cardType == CARD_SD){
+        Serial.println("SDSC");
+    } else if(cardType == CARD_SDHC){
+        Serial.println("SDHC");
+    } else {
+        Serial.println("UNKNOWN");
 
-void display_number(float v)
-{
-    display.setTextSize(2);
-    int n, x, y = display.getCursorY();
-    if(v<100) {
-        n = v*100;
-        x = 23;
-    }    else {
-        n = v*10;
-        x = 34;
+        uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+        Serial.printf("SD Card Size: %lluMB\n", cardSize);
+        Serial.printf("Total space: %lluMB\n", SD.totalBytes() / (1024 * 1024));
+        Serial.printf("Used space: %lluMB\n", SD.usedBytes() / (1024 * 1024));
     }
-    for(int i=0; i<4; i++) {
-        display.setCursor((3-i)*12,y);
-        display.print(n%10);
-        n/=10;
+#endif
+}
+
+void log(const char *message)
+{
+    Serial.println(message);
+    Serial.flush();
+#ifdef USE_BT
+    for(const char *c = message; *c; c++)
+        SerialBT.write(*c);
+#endif
+}
+
+void writedata(const char *message) {
+#ifdef USE_SD
+    static char buffer[8192];
+    strncat(buffer, message, 256);
+    if(strlen(buffer) < sizeof buffer - 256)
+        return;
+
+    fs::FS &fs = SD;
+    const char * path = "log.txt";
+    Serial.printf("Appending to file: %s\n", path);
+
+    File file = fs.open(path, FILE_APPEND);
+    if(!file) {
+        Serial.println("Failed to open file for appending");
+        buffer[0] = 0;
+        return;
     }
+    if(!file.print(buffer))
+        Serial.println("Append failed");
 
-    // draw decimal without wasting horizontal space    
-    display.fillCircle(x, y+14, 1, BLACK);
-    display.println("");
-} 
-
-void display_default()
-{
-    display.setTextColor(BLACK);
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.println("voltage");
-    display_number(vout);
-    display.setTextSize(1);
-    display.println("watts");
-    display_number(pout);
-
-    if(running) {
-        display.setTextSize(1);
-        display.println("\nmppt");
-        display.println(mppt_voltage);
-    } else
-        display.println("\nOFF");
-}
-
-void display_info()
-{
-    static uint32_t lt;
-    uint32_t t = HAL_GetTick();
-    uint32_t dt = t - lt;
-    lt = t;
-  
-    // rotation example
-    display.setTextSize(1);
-    display.setTextColor(BLACK);
-    display.setCursor(0, 0);
-    display.print("Vi ");
-
-    display.println(int(vin*100)/100.0);
-    display.print("Ii ");
-    display.println(iin);
-    display.print("Pi ");
-    display.println(pin);
-    display.print("Vo ");
-    display.println(int(vout*100)/100.0);
-    display.print("Io ");
-    display.println(iout);
-    display.print("Po ");
-    display.println(pout);
-
-    if(running) {
-        display.print("Eff ");
-        display.print(int(pout / pin * 100.0) );
-        display.println("%");
-        display.print("du ");
-        display.println(int(10000*duty)/100.0);    
-    } else
-        display.println("OFF");
-
-    //display.print ("hz ");
-    //display.println(dt);
-    //display.print("t ");
-    //display.println(temp);
-  
-    display.println(mppt_voltage);
-    display.println(debug);  
-}
-
-void display_set_off_voltage()
-{
-    display.setTextSize(1);
-    display.setTextColor(BLACK);
-    display.setCursor(0, 0);
-    display.println("PV Off");
-    display.print(eemem.off_voltage);
-    display.println("v");
-}
-
-void display_set_on_voltage()
-{
-    display.setTextSize(1);
-    display.setTextColor(BLACK);
-    display.setCursor(0, 0);
-    display.println("PV On");
-    display.print(eemem.on_voltage);
-    display.println("v");
-}
-
-void display_set_backlight()
-{
-    display.setTextSize(1);
-    display.setTextColor(BLACK);
-    display.setCursor(0, 0);
-    display.println("back\nlight");
-    display.println(eemem.backlight == LOW ? "on" : "off");
-    display.println("uses\n36mW");
-}
-
-int get_frequency()
-{
-    switch(eemem.frequency) {
-        case 1:
-           return 20000;
-        case 2:
-           return 40000;
-        case 3:
-           return 80000;
-        default:
-           eemem.frequency = 0;
-           return 10000;
-    }
-}
-
-void display_set_frequency()
-{
-    display.setTextSize(1);
-    display.setTextColor(BLACK);
-    display.setCursor(0, 0);
-    display.println("frequency");
-
-    display.println(get_frequency());
+    file.close();
+    buffer[0] = 0;
+#endif
 }
 
 
-void setup()   {  
-    // enable led output
-    pinMode(LED, OUTPUT);
-    digitalWrite(LED, HIGH); // off
-  
-    // enable sense and reference
-    digitalWrite(SENSE, HIGH);
-    pinMode(SENSE, OUTPUT);
+enum {IDLE, STANDBY, MPPT} state = IDLE;
 
-    // set input keys internal pullup resistor
-    for(int i=0; i<keys_n; i++)
-        pinMode(keys[i], INPUT_PULLUP);
+float readVoltage(int pin) {
+    int sensorValue = analogRead(pin);
+    return 3.3*sensorValue/4096*350/10*1.45;
+}
 
-    display.begin();
-    display.setContrast(50);
+float readCurrent(int pin) {
+    int sensorValue = analogRead(pin);
+    return 3.3 * sensorValue * 10 / 4096;
+}
 
-    display.display(); // show splashscreen
-
-    analogReadResolution(12); // set adc to use full 12 bits
-
-    // read eeprom settings for panel on and off voltage
-    EEPROM.get(0, eemem);
-    uint32_t sig = 0xF2BB328F;
-    if(eemem.sig != sig) {//
-        eemem.off_voltage = 13.6; // turn off above this voltage
-        eemem.on_voltage = 13.2;
-        eemem.backlight = LOW;
-        eemem.frequency = 0;
-        eemem.sig = sig;
-    }
-
-    // backlight
-    pinMode(BACKLIGHT, OUTPUT);
-    digitalWrite(BACKLIGHT, eemem.backlight);
-
-    setup_pwm();
+float readTemperature() {
+    int x = analogRead(tempInPin)+140;
+    float r = 4096.0/x-1;
+    float T = 1.0 / (1.0 / 298.0 + 1/3905.0 * log(r)) - 273.0;
+    return T;
 }
 
 
-void setup_pwm()
+float vcc, vdd, icc, idd, temperature;
+long lastt, ttotal;
+unsigned long statechange = millis();
+
+/*
+Current ripple or max current in discontinuous buck mode
+    current_max = duty / frequency / inductance * (vdd - vcc)
+
+at continous/discontinuous point
+    duty = vcc / vdd
+
+in discontinuous mode,  this is the max current in the inductor
+
+to solve the time to discharge inductor
+    time_dis = current * inductance / vcc
+
+at discontinuous point
+    time = (1-duty)/frequency
+
+for off time (diode conducting)
+    time_dis = duty / frequency * (vdd/vcc - 1)
+
+
+for boost dicontinuous mode
+   current_max = duty/frequency/inductance*vdd
+
+at discontinuous point
+   duty = 1-vdd/vcc
+
+   time_dis = current * inductance / (vcc - vdd)
+   time_dis = duty/frequency  / (vcc/vdd-1)
+
+*/
+float minduty()
 {
-    pwm_handle.Instance = TIM1;
-    pwm_handle.Channel = HAL_TIM_ACTIVE_CHANNEL_CLEARED;
-    pwm_handle.hdma[0] = NULL;
-    pwm_handle.hdma[1] = NULL;
-    pwm_handle.hdma[2] = NULL;
-    pwm_handle.hdma[3] = NULL;
-    pwm_handle.hdma[4] = NULL;
-    pwm_handle.hdma[5] = NULL;
-    pwm_handle.hdma[6] = NULL;
-    pwm_handle.Lock = HAL_UNLOCKED;
-    pwm_handle.State = HAL_TIM_STATE_RESET;
+    if(vcc > vdd)
+        return 1 - vdd / vcc;
+    else
+        return vcc / vdd - 1;
 
-    /* Configure timer with some default values */
-    pwm_handle.Init.Prescaler = 0;
-    pwm_handle.Init.Period = 400;
-    pwm_handle.Init.CounterMode = TIM_COUNTERMODE_UP;
-    pwm_handle.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    pwm_handle.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-
-    TIM_HandleTypeDef *h = &pwm_handle;
-    enableTimerClock(h);
-    HAL_TIM_Base_Init(h);
-
-    /* Configure some default values. Maybe overwritten later */
-    TIM_OC_InitTypeDef channelOC;
-    channelOC.OCMode = TIMER_NOT_USED;
-    channelOC.Pulse = __HAL_TIM_GET_COMPARE(h, TIM_CHANNEL_1);
-    channelOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-    channelOC.OCFastMode = TIM_OCFAST_DISABLE;
-    channelOC.OCIdleState = TIM_OCIDLESTATE_RESET;
-    channelOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
-    channelOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-    channelOC.OCMode = TIM_OCMODE_PWM1;
-
-    HAL_TIM_PWM_ConfigChannel(h, &channelOC, TIM_CHANNEL_1);
-
-    /* Set the Break feature & Dead time */
-    TIM_BreakDeadTimeConfigTypeDef sBreakConfig;
-    sBreakConfig.BreakState       = TIM_BREAK_DISABLE;
-    sBreakConfig.DeadTime         = deadtime;
-    sBreakConfig.OffStateRunMode  = TIM_OSSR_ENABLE;
-    sBreakConfig.OffStateIDLEMode = TIM_OSSI_ENABLE;
-    sBreakConfig.LockLevel        = 0;//TIM_LOCKLEVEL_1;  
-    sBreakConfig.BreakPolarity    = TIM_BREAKPOLARITY_LOW;  // does matter?
-    sBreakConfig.AutomaticOutput  = TIM_AUTOMATICOUTPUT_ENABLE;
-  
-    HAL_TIMEx_ConfigBreakDeadTime(h, &sBreakConfig);
-    LL_TIM_SetPrescaler(TIM1, 0);
+//    duty += .1; // add some margin to ensure forward transfer
 }
 
-void pwm_on()
+float maxduty()
 {
-    // enable 12v power
-    pinMode(DRIVER_POWER, OUTPUT);
-    digitalWrite(DRIVER_POWER, HIGH);
-    delay(10);
-  
-    // ensure bootstrap capacitor is charged by manually setting low side mosfet on
-    digitalWrite(PB13, LOW);
-    digitalWrite(PA8, LOW);
-    pinMode(PB13, OUTPUT);
-    pinMode(PA8, OUTPUT);
-    digitalWrite(PB13, HIGH);
-    digitalWrite(PB13, LOW);
+    // dont boost more than 4x input or up to max voltage
+    return min(1 - vdd/maxVoltage, .75f);
+}
+
+void control_log(const char *message)
+{
+    Serial.print("status: ");
+    Serial.println(message);
+}
+
+void idle(const char *reason)
+{
+    if(state == IDLE)
+        return;
+
+    pinMode(pwrdwnPin, OUTPUT);
+    digitalWrite(pwrdwnPin, HIGH);
 
     delay(1);
-    delay(1);
+    mcpwm_set_signal_low(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A);
+
+    mcpwm_set_signal_low(MCPWM_UNIT_1, MCPWM_TIMER_1, MCPWM_OPR_A);
+    mcpwm_set_signal_low(MCPWM_UNIT_1, MCPWM_TIMER_1, MCPWM_OPR_B);
+    mcpwm_stop(MCPWM_UNIT_0, MCPWM_TIMER_0);
+    mcpwm_stop(MCPWM_UNIT_1, MCPWM_TIMER_1);
+
+    state = IDLE;
+    Serial.print("STATE: idle: ");
+    Serial.println(reason);
+}
+
+void controlloop()
+{
+    int laststate = state;
     
-    // begin pwm
-    pwm_max = 8000000 / get_frequency();
+    if(vcc > maxVoltage)
+        idle("Output over voltage");
+    else if(vdd > maxVoltage)
+        idle("Input over voltage");
+    else if(idd > maxInputCurrent)
+       idle("Output over current");
+    else if(icc > maxInputCurrent)
+        idle("Input over current");
+    else if(vcc > endVoltage)
+        idle("Reached end voltage");
+    else if(vcc < minVoltage || vdd < minVoltage)
+        idle("min voltage");
 
-    min_duty = .5;
-    pwm_min_comp = deadtime*5/2;
-    max_duty = 1 - (float)pwm_min_comp/pwm_max;
+    float min_duty = minduty(), max_duty = maxduty();
+    if(max_duty - min_duty < .2)
+      idle("insufficient duty range");
+    
+    switch(state) {
+    case IDLE:
+        pinMode(buck_hPin, OUTPUT);
+        digitalWrite(buck_hPin, LOW);
+        pinMode(buck_lPin, OUTPUT);
+        digitalWrite(buck_lPin, LOW);
 
-    __HAL_TIM_SET_AUTORELOAD(&pwm_handle, pwm_max);
-    __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, 35);
+        digitalWrite(ledPin, HIGH); // turn LED off
 
-    pinmap_pinout(digitalPinToPinName(PA8), PinMap_PWM); 
-    HAL_TIM_PWM_Start(&pwm_handle, TIM_CHANNEL_1);
-    for(int i=10; i<90; i++) {
-        __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, i*4);
+        if(millis() - statechange > 2000) {
+            if(vdd < minVoltage || vcc > startVoltage) {
+                const unsigned long long uS_TO_S_FACTOR = 1000000ULL;
+                esp_sleep_enable_timer_wakeup(10 * uS_TO_S_FACTOR);
+                if(vdd < minVoltage)
+                    control_log("insufficient input voltage");
+                else {
+                    control_log("output voltage exceeds start voltage");
+                    Serial.print(vcc);
+                    Serial.print(" > ");
+                    Serial.println(startVoltage);
+                }
+
+                control_log("going to sleep now");
+                esp_deep_sleep_start();
+            } else if(vcc < startVoltage) {
+                state = STANDBY; // otherwise turn on
+                control_log("STATE: standby");
+            }
+        }
+        
+        delay(20);
+        break;
+
+    case STANDBY:
+        digitalWrite(ledPin, LOW); // turn LED ON
+
+        pinMode(pwrdwnPin, OUTPUT);
+        digitalWrite(pwrdwnPin, LOW); // turn on 12v power
+
+        // charge bootstrap
         delay(1);
-    }     
+        digitalWrite(buck_lPin, HIGH);
+        delay(1);
 
-  duty = 1;
-  pwm_set();
-    // enable pwm (with dead time) to drive low-side mosfet now
-    pinmap_pinout(digitalPinToPinName(PB13), PinMap_PWM);
-    HAL_TIMEx_PWMN_Start(&pwm_handle, TIM_CHANNEL_1);
+        vmppt = (vdd+vcc)/2;
+        if(millis() - statechange > 3000) {
+            control_log("STATE: mppt");
+            duty = minduty();
+            state = MPPT;
+
+            digitalWrite(buck_lPin, LOW);
+
+            // setup up pwm output
+            mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0A, buck_hPin);
+            //mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0B, buck_lPin);
+
+            mcpwm_gpio_init(MCPWM_UNIT_1, MCPWM1A, boost_hPin);
+            mcpwm_gpio_init(MCPWM_UNIT_1, MCPWM1B, boost_lPin);
+            
+
+//            mcpwm_group_set_resolution(MCPWM_UNIT_0, 80000000);
+//            mcpwm_timer_set_resolution(MCPWM_UNIT_0, MCPWM_TIMER_0, 10000000);
+
+            // use 40khz frequency
+            mcpwm_config_t pwm_config;
+            pwm_config.frequency = 20000;
+            pwm_config.cmpr_a = 0;
+            pwm_config.cmpr_b = 0;
+            pwm_config.counter_mode = MCPWM_UP_COUNTER;
+            pwm_config.duty_mode = MCPWM_DUTY_MODE_0;
+
+            // setup deadtime to ensure both transistors are off
+            // 3 is 3x100ns    The transistors appear to switch in 100ns
+            mcpwm_deadtime_enable(MCPWM_UNIT_1, MCPWM_TIMER_1, MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE, 3, 3);
+        
+            mcpwm_init(MCPWM_UNIT_0, MCPWM_TIMER_0, &pwm_config);   //Configure PWM0A & PWM0B with above
+
+
+            pwm_config.frequency = 2000;
+            pwm_config.cmpr_a = 0;
+            pwm_config.cmpr_b = 0;
+            pwm_config.counter_mode = MCPWM_UP_COUNTER;
+            pwm_config.duty_mode = MCPWM_DUTY_MODE_0;
+            mcpwm_init(MCPWM_UNIT_1, MCPWM_TIMER_1, &pwm_config);   //Configure PWM0A & PWM0B with above            
+
+            mcpwm_start(MCPWM_UNIT_0, MCPWM_TIMER_0);
+            mcpwm_start(MCPWM_UNIT_1, MCPWM_TIMER_1);
+            
+            mcpwm_set_duty(MCPWM_UNIT_0,MCPWM_TIMER_0,MCPWM_OPR_A,0);
+            //mcpwm_set_duty(MCPWM_UNIT_0,MCPWM_TIMER_0,MCPWM_OPR_B,99);
+            
+            mcpwm_set_duty(MCPWM_UNIT_1,MCPWM_TIMER_1,MCPWM_OPR_A,0);
+            mcpwm_set_duty(MCPWM_UNIT_1,MCPWM_TIMER_1,MCPWM_OPR_B,0);
+        }
+        break;
+
+    case MPPT:
+    {
+        float err = (vdd - vmppt);
+        duty += .0005 * err; // adjust duty to follow mppt voltage
+
+        if(idd > maxInputCurrent)
+            duty -= .1 * (idd - maxInputCurrent);
+
+        duty = min(max(duty, min_duty), max_duty);
+
+
+        if(duty < -.01) {
+            mcpwm_set_duty(MCPWM_UNIT_0,MCPWM_TIMER_0,MCPWM_OPR_A,100*(1+duty));
+            //mcpwm_set_duty(MCPWM_UNIT_0,MCPWM_TIMER_0,MCPWM_OPR_B,0);
+
+            mcpwm_set_duty(MCPWM_UNIT_1,MCPWM_TIMER_1,MCPWM_OPR_A,99.5);
+            mcpwm_set_duty(MCPWM_UNIT_1,MCPWM_TIMER_1,MCPWM_OPR_B,99.5);
+        } else if(duty > .01) {
+            // for now not boosting
+            if(duty > 0)
+                duty = 0;
+
+            //mcpwm_set_duty(MCPWM_UNIT_0,MCPWM_TIMER_0,MCPWM_OPR_A,99);
+            //mcpwm_set_duty(MCPWM_UNIT_0,MCPWM_TIMER_0,MCPWM_OPR_B,0);
+
+            //mcpwm_set_duty(MCPWM_UNIT_1,MCPWM_TIMER_1,MCPWM_OPR_A,0);
+            //mcpwm_set_duty(MCPWM_UNIT_1,MCPWM_TIMER_1,MCPWM_OPR_B,100*duty);
+        } else {
+            // duty is nearly neutral,  just keep both sides on
+            mcpwm_set_duty(MCPWM_UNIT_0,MCPWM_TIMER_0,MCPWM_OPR_A,99);
+            //mcpwm_set_duty(MCPWM_UNIT_0,MCPWM_TIMER_0,MCPWM_OPR_B,0);
+
+            //mcpwm_set_duty(MCPWM_UNIT_1,MCPWM_TIMER_1,MCPWM_OPR_A,0);
+            //mcpwm_set_duty(MCPWM_UNIT_1,MCPWM_TIMER_1,MCPWM_OPR_B,100*duty);
+        }
+
+
+        static float trackingdir = .1, avgpout, lastpout;
+        static int trackingcount = 0;
+        if(icc > 0.2)
+            if(fabs(vdd-vmppt) < .15 || duty == max_duty || duty == min_duty) {
+                float pout = vcc*icc;
+                avgpout += pout;
+                trackingcount++;
+            }
+
+        float pin = vdd*idd, pout = vcc*icc;
+        if(trackingcount == 10) {
+            avgpout /= trackingcount;
+            trackingcount = 0;
+            avgpout = 0;
+
+            if(lastpout > avgpout) // change dir
+                trackingdir = -trackingdir;
+            lastpout = avgpout;
+
+            if(duty == max_duty) {
+                trackingdir = fabs(trackingdir);
+                Serial.println("max duty mppt");
+            } else if(duty == min_duty) {
+                trackingdir = -fabs(trackingdir);
+                Serial.println("min duty mppt");
+            }
+
+            vmppt += trackingdir; // update voltage set point
+
+
+            if(duty >= 0)
+                idle("Buck mode only!");
+        }
+    }  break;
+    }
+    
+    if(temperature > 45)
+        idle("OverTemperature");
+
+    if(state != laststate)
+        statechange = millis();
 }
 
-void pwm_set()
+int global_samplecount;
+void control(void *param)
 {
-    int compare = pwm_max*(1.0-duty);
+    unsigned long t0 = millis();
+    const int loop_period = 100;
+    for(;;) {
+        int samplecount = 0;
+        float vcc_in = 0, vdd_in = 0, icc_in = 0, idd_in = 0;
+        float temperature_in = 0;
+        while(samplecount < 10 || millis()-t0 < loop_period - 10) {
+            vcc_in+=readVoltage(vccInPin);
+            vdd_in+=readVoltage(vddInPin);
+            icc_in+=readCurrent(iccInPin);
+            idd_in+=readCurrent(iddInPin);
 
-    if(compare < pwm_min_comp)
-        compare = pwm_min_comp;   // minimum allowed
+            samplecount++;
+        }
 
-    if(compare > pwm_max/2)
-        compare = pwm_max;  // maximum allowed
+        temperature_in = readTemperature();
 
-    __HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, pwm_max-compare);
-    //__HAL_TIM_SET_COMPARE(&pwm_handle, TIM_CHANNEL_1, pwm_max-65);
+        temperature = temperature*.95+temperature_in*.05;
+        
+        global_samplecount = samplecount;
+
+        vcc = vcc_in / samplecount;
+        vdd = vdd_in / samplecount;
+        icc = icc_in / samplecount;
+        idd = idd_in / samplecount;
+        
+        controlloop();
+        unsigned long t1 = millis();
+        ttotal = t1 - t0;
+
+        if(ttotal < loop_period) {
+            unsigned long dt = ttotal > loop_period ? loop_period : ttotal;
+            const TickType_t xDelay = (loop_period - ttotal) / portTICK_PERIOD_MS;
+            vTaskDelay( xDelay );
+            t0 += loop_period;
+        } else
+            t0 = t1;
+    }
 }
 
-void pwm_off()
-{
+TaskHandle_t Control;                 //SYSTEM PARAMETER  - Used for the ESP32 dual core operation
+void setup() {
 
-    digitalWrite(PB13, LOW);
-    digitalWrite(PA8, LOW);
-    pinMode(PB13, OUTPUT);
-    pinMode(PA8, OUTPUT);
-    HAL_TIM_PWM_Stop(&pwm_handle, TIM_CHANNEL_1);
-    HAL_TIMEx_PWMN_Stop(&pwm_handle, TIM_CHANNEL_1);
+#ifdef USE_BT
+    SerialBT.begin("mppt-node"); //Bluetooth device name
+#endif
+    Serial.begin(115200);
 
-    return;
+    setupSD();
 
-    delay(10);
-    // disable 12v power
-    pinMode(DRIVER_POWER, OUTPUT);
-    digitalWrite(DRIVER_POWER, LOW);
+    pinMode(pwrdwnPin, OUTPUT);
+    digitalWrite(pwrdwnPin, HIGH);
+    
+    // initialize serial communications
+    pinMode(ledPin, OUTPUT);
+    digitalWrite(ledPin, HIGH);
+
+
+    int sketchsize = ESP.getSketchSize();
+    delay(100);
+    uint64_t fusemac = ESP.getEfuseMac();
+    uint8_t* chipid = (uint8_t*) & fusemac;
+    char mac[20];
+    snprintf(mac, sizeof mac, "%02x:%02x:%02x:%02x:%02x:%02x", chipid[0], chipid[1], chipid[2], chipid[3], chipid[4], chipid[5]);
+    Serial.print("mac ");
+    Serial.println(mac);
+
+    xTaskCreatePinnedToCore(control,"control",10000,NULL,9/*priority*/,&Control,0);
+
+    delay(200);
 }
 
-void update_duty() {
-    // update duty cycle with pid filter on input voltage
-    float err = (vin - mppt_voltage);
-    float vindt = vin - lastvin;
-
-    // D should be less than P
-    float P = .01, D = 0;
-    duty += P*err + D*vindt;
-    if(duty > max_duty)
-        duty = max_duty;
-
-    // for now, avoid large voltage differences
-    if(duty < min_duty)
-        duty = min_duty;
-
-    pwm_set();
-}
 
 void loop()
 {
-    int samples = 256;
-    int channels[] = {PA0, PA1, PA2, PA3, PB0};
-    int adc_n = (sizeof channels)/(sizeof *channels);
-    vin = vout = iin = iout = 0;
-    static float offin, offout;
-    float offin_s = 0, offout_s = 0;
+    char buf[256];
+    float pin = vdd*idd, pout = vcc*icc;
+    float efficiency;
+    if(pin)
+        efficiency = pout / pin * 100.0f;
+    else
+        efficiency = 0;
 
-    for(int count = 0; count < samples; count++) {
-        uint32_t reading[6];
-        for(int i=0; i<adc_n; i++)
-            reading[i]=analogRead(channels[i]);
-      
-        vin += reading[0]/4096.0 * 3.3 * 13;
-        vout +=reading[1]/4096.0 * 3.3 * 13;
-        int csref = reading[4];
-        iin += ((float)csref-reading[2]-offin)*3.3/(4096*.001*200)   *1.2;
-        iout += ((float)csref-reading[3]-offout)*3.3/(4096*.001*200) *1.2;
-
-        if(!running) {
-            offin_s+=(float)csref-reading[2];
-            offout_s+=(float)csref-reading[3];
-        }
-
-        if((count & 0x1f) == 0)
-            read_keys(); // read keys a bit more often
+    if(vcc || vdd) {
+        sprintf(buf, "mppt (%.2fV %.2fA %.1fW) (%.2fV %.2fA %.1fW) %.4f%% %.2fV %.1fC %.1f%% %ldms %d", vdd, idd, pin, vcc, icc, pout, 100.0f*duty, vmppt, temperature, efficiency, ttotal, global_samplecount);
+        log(buf);
     }
+//writ_edata(buf);
+    //vTaskGetRunTimeStats(buf);
 
-    vin /= samples;
-    vout /= samples;
-    iin /= samples;
-    iout /= samples;
+    //Serial.println(buf);
 
-    if(!running) {
-        offin = offin_s/samples;
-        offout = offout_s/samples;
-    }
-
-    pin = vin*iin;
-    pout = vout*iout;
-
-    // read temp less frequently, internal channels take longer also
-    uint16_t treading = analogRead(ATEMP);
-    // convert to degrees C
-    float rtemp = ((1.43-treading/4096.0*3.3)/0.0043) + 25;
-    temp = .9*temp + .1*rtemp; //lowpass
-
-    if(running) {
-        uint32_t t = HAL_GetTick();
-        if(t-on_time > 500) { // don't stop or adjust duty unless running at least 500 ticks
-            // overtemp, current has gone negative, or output voltage too high: turn off
-            if(temp > max_temp || iout < -.05 || vout > eemem.off_voltage || pwm_max != 8000000 / get_frequency()) {
-                pwm_off();
-                off_time = t;
-                running = false;
-                digitalWrite(LED, HIGH); // off
-            } else {
-                update_duty();
-                static float trackingdir = .15, avgpout;
-                static int trackingcount = 0;
-                if(fabs(vin-mppt_voltage) < .05 || duty == max_duty || duty == min_duty) {
-                    trackingcount++;
-                    avgpout += pout;
-                }
-                if(trackingcount == 5) {
-                    avgpout /= trackingcount;
-                    debug = max_duty;
-                    trackingcount = 0;
-                    if(lastpout > avgpout) // change dir
-                        trackingdir = -trackingdir;
-                    if(duty == max_duty)
-                        trackingdir = fabs(trackingdir);
-                    else if(duty == min_duty)
-                        trackingdir = -fabs(trackingdir);
-                    lastpout = avgpout;
-                    mppt_voltage += trackingdir;
-                    avgpout = 0;
-                }
-            }
-        }
-    } else { // not running
-        if(temp+1 < max_temp && vin > vout+1 && vout < eemem.on_voltage) {
-            uint32_t t = HAL_GetTick();
-            if(t-off_time > 3000) { // 10 seconds
-                on_time = t;
-                pwm_on();
-                running = true;
-                digitalWrite(LED, LOW); // on
-            }
-        }
-    }
-
-    lastvin = vin;
- 
-    display.clearDisplay();
-    display.setRotation(1);
-    switch(page) {
-    case 0: display_default(); break;
-    case 1: display_info(); break;
-    case 2: display_set_off_voltage(); break;
-    case 3: display_set_on_voltage(); break;
-    case 4: display_set_backlight(); break;
-    case 5: display_set_frequency(); break;
-    }
-
-    if(temp > max_temp) {
-        display.clearDisplay();
-        display.setTextSize(2);
-        display.setCursor(0,0);
-        display.println("WARNING");
-        display.println("OVERTEMP");
-    }
-  
-    display.display();
+    // Wait for the next cycle.
+    const TickType_t xDelay = 1000 / portTICK_PERIOD_MS;
+    vTaskDelay( xDelay );
 }
